@@ -26,30 +26,22 @@
 #define MM256_SET_M128I(a, b) _mm256_insertf128_si256(_mm256_castsi128_si256(b), (a), 1)
 
 #if defined(__AVX__) || defined(__AVX2__) || defined(__AVX512F__) || defined(__SSSE3__)
+// The sign_epi8 + maddubs helpers below compute x[i] * y[i] exactly when y
+// contains no -128 byte: sign_epi8 cannot negate -128 (the negation wraps back
+// to -128), and (-128) * (-128) = 16384 has no u8 x s8 factorization at all.
+// x may be -128, because its magnitude goes into the u8 lane of maddubs and
+// |-128| = 128 is a valid u8. Call sites therefore pass the full-range side
+// (the activation, reachable as -128 through the public API / third-party
+// data) as x and the structurally bounded weight as y: q4_0 [-8,7], q5_0
+// [-16,15], iq1 grids {-1,0,1}, iq4 grids >= -127, fp4 lookups small, and
+// llama.cpp's own q8 quantizers clamp to [-127,127]. Pair sums then stay within
+// 2 * 128 * 127 = 32512 < 2^15. The only type with a full-range weight side is
+// q8_0 (q8_0 x q8_0); its call sites use the *_guarded variants, which scan y
+// once and widen only -128 blocks to int16/int32 (slow path, exact for any
+// int8 input).
+
 // multiply int8_t, add results pairwise twice
 static inline __m128i mul_sum_i8_pairs(const __m128i x, const __m128i y) {
-    // The sign_epi8 + maddubs trick below cannot negate -128 (negating -128 in
-    // int8 stays -128), so it is only exact when y contains no -128 byte, and
-    // (-128) * (-128) = 16384 has no u8 x s8 factorization at all. Such blocks
-    // are rare (llama.cpp's own quantizers clamp to [-127, 127]) but reachable
-    // via the public API and third-party data. For those, widen both operands
-    // to 16 bits and accumulate in int32: each product fits in [-16384, 16384]
-    // and any sum of them fits in int32. Lane layout (4 products per int32,
-    // bytes 0-3, 4-7, 8-11, 12-15) matches the fast path.
-    const __m128i yeq128 = _mm_cmpeq_epi8(y, _mm_set1_epi8(-128));
-    if (_mm_movemask_epi8(yeq128)) {
-        const __m128i xl = _mm_srai_epi16(_mm_unpacklo_epi8(x, x), 8); // sign-extend bytes to int16
-        const __m128i xh = _mm_srai_epi16(_mm_unpackhi_epi8(x, x), 8);
-        const __m128i yl = _mm_srai_epi16(_mm_unpacklo_epi8(y, y), 8);
-        const __m128i yh = _mm_srai_epi16(_mm_unpackhi_epi8(y, y), 8);
-        const __m128i pl = _mm_madd_epi16(xl, yl); // 2 products per int32: bytes 0-7
-        const __m128i ph = _mm_madd_epi16(xh, yh); // bytes 8-15
-        // add adjacent lanes (valid sums land in lanes 0 and 2), then compact them
-        const __m128i sl = _mm_add_epi32(pl, _mm_shuffle_epi32(pl, _MM_SHUFFLE(2, 3, 0, 1)));
-        const __m128i sh = _mm_add_epi32(ph, _mm_shuffle_epi32(ph, _MM_SHUFFLE(2, 3, 0, 1)));
-        return _mm_unpacklo_epi64(_mm_shuffle_epi32(sl, _MM_SHUFFLE(3, 1, 2, 0)),
-                                  _mm_shuffle_epi32(sh, _MM_SHUFFLE(3, 1, 2, 0)));
-    }
     // Get absolute values of x vectors
     const __m128i ax = _mm_sign_epi8(x, x);
     // Sign the values of the y vectors
@@ -58,6 +50,23 @@ static inline __m128i mul_sum_i8_pairs(const __m128i x, const __m128i y) {
     const __m128i dot = _mm_maddubs_epi16(ax, sy);
     const __m128i ones = _mm_set1_epi16(1);
     return _mm_madd_epi16(ones, dot);
+}
+
+// widening variant of mul_sum_i8_pairs: exact int32 result for any int8 input,
+// lane layout (4 products per int32, bytes 0-3, 4-7, 8-11, 12-15) identical to
+// the fast path; used by the guarded q8_0 paths below
+static inline __m128i mul_sum_i8_pairs_wide(const __m128i x, const __m128i y) {
+    const __m128i xl = _mm_srai_epi16(_mm_unpacklo_epi8(x, x), 8); // sign-extend bytes to int16
+    const __m128i xh = _mm_srai_epi16(_mm_unpackhi_epi8(x, x), 8);
+    const __m128i yl = _mm_srai_epi16(_mm_unpacklo_epi8(y, y), 8);
+    const __m128i yh = _mm_srai_epi16(_mm_unpackhi_epi8(y, y), 8);
+    const __m128i pl = _mm_madd_epi16(xl, yl); // 2 products per int32: bytes 0-7
+    const __m128i ph = _mm_madd_epi16(xh, yh); // bytes 8-15
+    // add adjacent lanes (valid sums land in lanes 0 and 2), then compact them
+    const __m128i sl = _mm_add_epi32(pl, _mm_shuffle_epi32(pl, _MM_SHUFFLE(2, 3, 0, 1)));
+    const __m128i sh = _mm_add_epi32(ph, _mm_shuffle_epi32(ph, _MM_SHUFFLE(2, 3, 0, 1)));
+    return _mm_unpacklo_epi64(_mm_shuffle_epi32(sl, _MM_SHUFFLE(3, 1, 2, 0)),
+                              _mm_shuffle_epi32(sh, _MM_SHUFFLE(3, 1, 2, 0)));
 }
 
 #if __AVX__ || __AVX2__ || __AVX512F__
@@ -88,50 +97,11 @@ static inline int hsum_i32_4(const __m128i a) {
 }
 
 #if defined(__AVX2__) || defined(__AVX512F__)
+// multiply two int8_t vectors pairwise and return pair sums (contract: see top of file)
 static inline __m256i mul_add_epi8(const __m256i x, const __m256i y) {
-    // rare: some y byte is -128, which sign_epi8/maddubs cannot handle exactly;
-    // widen to int16/int32 for those blocks (see mul_sum_i8_pairs)
-    if (_mm256_movemask_epi8(_mm256_cmpeq_epi8(y, _mm256_set1_epi8(-128)))) {
-        const __m128i yl = _mm256_castsi256_si128(y);
-        const __m128i yh = _mm256_extracti128_si256(y, 1);
-        const __m128i xl = _mm256_castsi256_si128(x);
-        const __m128i xh = _mm256_extracti128_si256(x, 1);
-        const __m256i p0 = _mm256_madd_epi16(_mm256_cvtepi8_epi16(xl),                   _mm256_cvtepi8_epi16(yl));                       // bytes 0-7
-        const __m256i p1 = _mm256_madd_epi16(_mm256_cvtepi8_epi16(_mm_srli_si128(xl, 8)), _mm256_cvtepi8_epi16(_mm_srli_si128(yl, 8)));  // bytes 8-15
-        const __m256i p2 = _mm256_madd_epi16(_mm256_cvtepi8_epi16(xh),                   _mm256_cvtepi8_epi16(yh));                       // bytes 16-23
-        const __m256i p3 = _mm256_madd_epi16(_mm256_cvtepi8_epi16(_mm_srli_si128(xh, 8)), _mm256_cvtepi8_epi16(_mm_srli_si128(yh, 8)));  // bytes 24-31
-        // repack the int32 pair sums to int16 in maddubs lane order
-        // (the guard only fires for y = -128; no caller can pass x = -128 here,
-        // so |pair sum| <= 2 * 127 * 128 < 2^15 and the saturating pack is exact)
-        const __m256i a = _mm256_set_m128i(_mm256_castsi256_si128(p2), _mm256_castsi256_si128(p0));
-        const __m256i b = _mm256_set_m128i(_mm256_castsi256_si128(p3), _mm256_castsi256_si128(p1));
-        return _mm256_packs_epi32(a, b);
-    }
     const __m256i ax = _mm256_sign_epi8(x, x);
     const __m256i sy = _mm256_sign_epi8(y, x);
     return _mm256_maddubs_epi16(ax, sy);
-}
-
-// pair sums of ±y (per-byte sign taken from delta), exact also for y = -128
-static inline __m256i sign_delta_pairs(const __m128i y8, const __m128i d8) {
-    const __m256i vy = _mm256_cvtepi8_epi16(y8);
-    const __m256i m  = _mm256_srai_epi16(_mm256_cvtepi8_epi16(d8), 15);
-    const __m256i v  = _mm256_sub_epi16(_mm256_xor_si256(vy, m), m); // -(-128) in int16 is exact
-    return _mm256_madd_epi16(v, _mm256_set1_epi16(1));
-}
-
-static inline __m256i mul_sign_delta_i8(const __m256i y, const __m256i delta) {
-    const __m128i yl = _mm256_castsi256_si128(y);
-    const __m128i yh = _mm256_extracti128_si256(y, 1);
-    const __m128i dl = _mm256_castsi256_si128(delta);
-    const __m128i dh = _mm256_extracti128_si256(delta, 1);
-    const __m256i p0 = sign_delta_pairs(yl, dl);                                    // bytes 0-7
-    const __m256i p1 = sign_delta_pairs(_mm_srli_si128(yl, 8), _mm_srli_si128(dl, 8)); // bytes 8-15
-    const __m256i p2 = sign_delta_pairs(yh, dh);                                    // bytes 16-23
-    const __m256i p3 = sign_delta_pairs(_mm_srli_si128(yh, 8), _mm_srli_si128(dh, 8)); // bytes 24-31
-    const __m256i a = _mm256_set_m128i(_mm256_castsi256_si128(p2), _mm256_castsi256_si128(p0));
-    const __m256i b = _mm256_set_m128i(_mm256_castsi256_si128(p3), _mm256_castsi256_si128(p1));
-    return _mm256_packs_epi32(a, b); // |pair sum| <= 256, exact
 }
 
 // spread 32 bits to 32 bytes { 0x00, 0xFF }
@@ -181,19 +151,33 @@ static inline __m256 mul_sum_us8_pairs_float(const __m256i ax, const __m256i sy)
 }
 
 // multiply int8_t, add results pairwise twice and return as float vector
+// (contract: see top of file; on AVX-VNNI-INT8 dpbssd is signed x signed and
+// exact for any int8 operands, so no contract is needed there)
 static inline __m256 mul_sum_i8_pairs_float(const __m256i x, const __m256i y) {
 #if __AVXVNNIINT8__
     const __m256i zero = _mm256_setzero_si256();
     const __m256i summed_pairs = _mm256_dpbssd_epi32(zero, x, y);
     return _mm256_cvtepi32_ps(summed_pairs);
 #else
-    // sign_epi8 cannot negate -128, so the u8 x s8 products of maddubs/dpbusd
-    // are only exact when y contains no -128 byte (and (-128) * (-128) = 16384
-    // has no u8 x s8 factorization at all). Such blocks are rare (llama.cpp's
-    // quantizers clamp to [-127, 127]) but reachable via the public API and
-    // third-party data. For those, widen both operands to 16 bits and
-    // accumulate in int32. Callers broadcast one scale per block and hsum, so
-    // any layout with all 32 products in the 8 lanes is valid.
+    // Get absolute values of x vectors
+    const __m256i ax = _mm256_sign_epi8(x, x);
+    // Sign the values of the y vectors
+    const __m256i sy = _mm256_sign_epi8(y, x);
+    return mul_sum_us8_pairs_float(ax, sy);
+#endif
+}
+
+// q8_0 x q8_0 only: both operands are full-range int8, so the operand order
+// cannot give sign_epi8 a safe y. Scan y once and widen only -128 blocks to
+// int16/int32; llama.cpp's own quantizers clamp to [-127,127], so normal
+// traffic takes the fast path (and AVX-VNNI-INT8's dpbssd needs no scan at
+// all). The widened lanes hold all 32 products in groups of four (lane k =
+// bytes 2k,2k+1 of the low and 16+2k,16+2k+1 of the high 128-bit half), which
+// is valid because callers broadcast a single scale per block and hsum.
+static inline __m256 mul_sum_i8_pairs_float_guarded(const __m256i x, const __m256i y) {
+#if __AVXVNNIINT8__
+    return mul_sum_i8_pairs_float(x, y); // dpbssd is exact for any int8 input
+#else
     const __m256i yeq128 = _mm256_cmpeq_epi8(y, _mm256_set1_epi8(-128));
     if (!_mm256_testz_si256(yeq128, yeq128)) {
         const __m256i xlo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(x));
@@ -204,11 +188,7 @@ static inline __m256 mul_sum_i8_pairs_float(const __m256i x, const __m256i y) {
         const __m256i phi = _mm256_madd_epi16(xhi, yhi);
         return _mm256_cvtepi32_ps(_mm256_add_epi32(plo, phi)); // 4 products per lane
     }
-    // Get absolute values of x vectors
-    const __m256i ax = _mm256_sign_epi8(x, x);
-    // Sign the values of the y vectors
-    const __m256i sy = _mm256_sign_epi8(y, x);
-    return mul_sum_us8_pairs_float(ax, sy);
+    return mul_sum_i8_pairs_float(x, y);
 #endif
 }
 
@@ -249,18 +229,8 @@ static inline __m128i packNibbles( __m128i bytes1, __m128i bytes2 )
     return _mm_packus_epi16( bytes1, bytes2);
 }
 
+// multiply two int8_t vectors pairwise and return pair sums (contract: see top of file)
 static inline __m128i mul_add_epi8_sse(const __m128i x, const __m128i y) {
-    // rare: some y byte is -128, which sign_epi8/maddubs cannot handle exactly;
-    // widen to int16/int32 for those blocks (see mul_sum_i8_pairs)
-    if (_mm_movemask_epi8(_mm_cmpeq_epi8(y, _mm_set1_epi8(-128)))) {
-        const __m128i p0 = _mm_madd_epi16(_mm_cvtepi8_epi16(x),                     _mm_cvtepi8_epi16(y));                     // bytes 0-7
-        const __m128i p1 = _mm_madd_epi16(_mm_cvtepi8_epi16(_mm_srli_si128(x, 8)), _mm_cvtepi8_epi16(_mm_srli_si128(y, 8))); // bytes 8-15
-        // repack the int32 pair sums to int16 in maddubs lane order
-        // (the guard only fires for y = -128; q8_0's full-range x diverts to
-        // int32 in mul_sum_i8_quad_float, so every remaining caller has
-        // |pair sum| <= 2 * 127 * 128 < 2^15 and the pack is exact)
-        return _mm_packs_epi32(p0, p1);
-    }
     const __m128i ax = _mm_sign_epi8(x, x);
     const __m128i sy = _mm_sign_epi8(y, x);
     return _mm_maddubs_epi16(ax, sy);
@@ -316,20 +286,12 @@ static inline __m256 mul_sum_us8_pairs_float(const __m256i ax, const __m256i sy)
 }
 
 // multiply int8_t, add results pairwise twice and return as float vector
+// (contract: see top of file)
 static inline __m256 mul_sum_i8_pairs_float(const __m256i x, const __m256i y) {
     const __m128i xl = _mm256_castsi256_si128(x);
     const __m128i xh = _mm256_extractf128_si256(x, 1);
     const __m128i yl = _mm256_castsi256_si128(y);
     const __m128i yh = _mm256_extractf128_si256(y, 1);
-    // rare: y contains -128, which sign_epi8/maddubs cannot handle exactly;
-    // mul_sum_i8_pairs widens to int16/int32 for those blocks (see there)
-    const __m128i yeq128 = _mm_or_si128(_mm_cmpeq_epi8(yl, _mm_set1_epi8(-128)),
-                                        _mm_cmpeq_epi8(yh, _mm_set1_epi8(-128)));
-    if (_mm_movemask_epi8(yeq128)) {
-        const __m128i lo = mul_sum_i8_pairs(xl, yl); // bytes 0-15
-        const __m128i hi = mul_sum_i8_pairs(xh, yh); // bytes 16-31
-        return _mm256_cvtepi32_ps(MM256_SET_M128I(hi, lo));
-    }
     // Get absolute values of x vectors
     const __m128i axl = _mm_sign_epi8(xl, xl);
     const __m128i axh = _mm_sign_epi8(xh, xh);
@@ -343,17 +305,40 @@ static inline __m256 mul_sum_i8_pairs_float(const __m256i x, const __m256i y) {
 }
 
 // larger version of mul_sum_i8_pairs_float where x and y are each represented by four 128-bit vectors
+// (contract: see top of file; the y_* halves must not contain -128)
 static inline __m256 mul_sum_i8_quad_float(const __m128i x_1_0, const __m128i x_1_1, const __m128i x_2_0, const __m128i x_2_1,
                                            const __m128i y_1_0, const __m128i y_1_1, const __m128i y_2_0, const __m128i y_2_1) {
-    // mul_sum_i8_pairs widens y = -128 halves to int32 itself, which is required
-    // for correctness here: two (-128) * (-128) products sum to 32768, and the
-    // int16 lanes of the mul_add_epi8_sse path would saturate that to 32767
-    // (reachable because q8_0 has full-range x). Its lane layout (4 products per
-    // int32) matches what madd(ones, p16) produced before, and it checks each
-    // half internally, so a clean fast path pays only its own single scan.
-    const __m128i p_1 = _mm_add_epi32(mul_sum_i8_pairs(x_1_0, y_1_0), mul_sum_i8_pairs(x_1_1, y_1_1));
-    const __m128i p_2 = _mm_add_epi32(mul_sum_i8_pairs(x_2_0, y_2_0), mul_sum_i8_pairs(x_2_1, y_2_1));
+    const __m128i mone = _mm_set1_epi16(1);
+
+    const __m128i p16_1_0 = mul_add_epi8_sse(x_1_0, y_1_0);
+    const __m128i p16_1_1 = mul_add_epi8_sse(x_1_1, y_1_1);
+    const __m128i p16_2_0 = mul_add_epi8_sse(x_2_0, y_2_0);
+    const __m128i p16_2_1 = mul_add_epi8_sse(x_2_1, y_2_1);
+    const __m128i p_1_0 = _mm_madd_epi16(p16_1_0, mone);
+    const __m128i p_1_1 = _mm_madd_epi16(p16_1_1, mone);
+    const __m128i p_2_0 = _mm_madd_epi16(p16_2_0, mone);
+    const __m128i p_2_1 = _mm_madd_epi16(p16_2_1, mone);
+    const __m128i p_1 = _mm_add_epi32(p_1_0, p_1_1);
+    const __m128i p_2 = _mm_add_epi32(p_2_0, p_2_1);
     return _mm256_cvtepi32_ps(MM256_SET_M128I(p_2, p_1));
+}
+
+// q8_0 x q8_0 only: single scan over the four y halves, widening only blocks
+// that actually contain -128 (the int16 lanes of the fast path would saturate
+// a (-128) * (-128) pair sum of 32768, and sign_epi8 cannot negate -128).
+// Lane layout of the widened path is identical to the fast path (4 products
+// per int32: bytes 0-3, 4-7, 8-11, 12-15 of each half pair).
+static inline __m256 mul_sum_i8_quad_float_guarded(const __m128i x_1_0, const __m128i x_1_1, const __m128i x_2_0, const __m128i x_2_1,
+                                                   const __m128i y_1_0, const __m128i y_1_1, const __m128i y_2_0, const __m128i y_2_1) {
+    const __m128i ne128 = _mm_set1_epi8(-128);
+    const __m128i yeq128 = _mm_or_si128(_mm_or_si128(_mm_cmpeq_epi8(y_1_0, ne128), _mm_cmpeq_epi8(y_1_1, ne128)),
+                                        _mm_or_si128(_mm_cmpeq_epi8(y_2_0, ne128), _mm_cmpeq_epi8(y_2_1, ne128)));
+    if (_mm_movemask_epi8(yeq128)) {
+        const __m128i p_1 = _mm_add_epi32(mul_sum_i8_pairs_wide(x_1_0, y_1_0), mul_sum_i8_pairs_wide(x_1_1, y_1_1));
+        const __m128i p_2 = _mm_add_epi32(mul_sum_i8_pairs_wide(x_2_0, y_2_0), mul_sum_i8_pairs_wide(x_2_1, y_2_1));
+        return _mm256_cvtepi32_ps(MM256_SET_M128I(p_2, p_1));
+    }
+    return mul_sum_i8_quad_float(x_1_0, x_1_1, x_2_0, x_2_1, y_1_0, y_1_1, y_2_0, y_2_1);
 }
 
 // quad fp16 delta calculation
@@ -827,7 +812,7 @@ void ggml_vec_dot_q4_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
 
         __m256i qy = _mm256_loadu_si256((const __m256i *)y[ib].qs);
 
-        const __m256 q = mul_sum_i8_pairs_float(qx, qy);
+        const __m256 q = mul_sum_i8_pairs_float(qy, qx);
 
         /* Multiply q with scale and accumulate */
         acc = _mm256_fmadd_ps( d, q, acc );
@@ -849,10 +834,10 @@ void ggml_vec_dot_q4_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
         const __m128i q4b_2_0 = _mm_sub_epi8(_mm_and_si128(_mm_set1_epi8(15), q4bits_2), _mm_set1_epi8(8));
         const __m128i q4b_2_1 = _mm_sub_epi8(_mm_and_si128(_mm_set1_epi8(15), _mm_srli_epi16(q4bits_2, 4)), _mm_set1_epi8(8));
 
-        const __m128i p16_1_0 = mul_add_epi8_sse(q4b_1_0, q8b_1_0);
-        const __m128i p16_1_1 = mul_add_epi8_sse(q4b_1_1, q8b_1_1);
-        const __m128i p16_2_0 = mul_add_epi8_sse(q4b_2_0, q8b_2_0);
-        const __m128i p16_2_1 = mul_add_epi8_sse(q4b_2_1, q8b_2_1);
+        const __m128i p16_1_0 = mul_add_epi8_sse(q8b_1_0, q4b_1_0);
+        const __m128i p16_1_1 = mul_add_epi8_sse(q8b_1_1, q4b_1_1);
+        const __m128i p16_2_0 = mul_add_epi8_sse(q8b_2_0, q4b_2_0);
+        const __m128i p16_2_1 = mul_add_epi8_sse(q8b_2_1, q4b_2_1);
         const __m128i p_1 = _mm_add_epi16(p16_1_0, p16_1_1);
         const __m128i p_2 = _mm_add_epi16(p16_2_0, p16_2_1);
         const __m256 p =  sum_i16_pairs_float(p_2, p_1);
@@ -885,12 +870,12 @@ void ggml_vec_dot_q4_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
         __m128i bx_0 = _mm_and_si128(lowMask, tmp_0_1);
         __m128i by_0 = _mm_loadu_si128((const __m128i *)y[ib].qs);
         bx_0 = _mm_sub_epi8(bx_0, off);
-        const __m128i i32_0 = mul_sum_i8_pairs(bx_0, by_0);
+        const __m128i i32_0 = mul_sum_i8_pairs(by_0, bx_0);
 
         __m128i bx_1 = _mm_and_si128(lowMask, _mm_srli_epi64(tmp_0_1, 4));
         __m128i by_1 = _mm_loadu_si128((const __m128i *)(y[ib].qs + 16));
         bx_1 = _mm_sub_epi8(bx_1, off);
-        const __m128i i32_1 = mul_sum_i8_pairs(bx_1, by_1);
+        const __m128i i32_1 = mul_sum_i8_pairs(by_1, bx_1);
 
         _mm_prefetch(&x[ib] + 2 * sizeof(block_q4_0), _MM_HINT_T0);
         _mm_prefetch(&y[ib] + 2 * sizeof(block_q8_0), _MM_HINT_T0);
@@ -903,12 +888,12 @@ void ggml_vec_dot_q4_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
         __m128i bx_2 = _mm_and_si128(lowMask, tmp_2_3);
         __m128i by_2 = _mm_loadu_si128((const __m128i *)y[ib + 1].qs);
         bx_2 = _mm_sub_epi8(bx_2, off);
-        const __m128i i32_2 = mul_sum_i8_pairs(bx_2, by_2);
+        const __m128i i32_2 = mul_sum_i8_pairs(by_2, bx_2);
 
         __m128i bx_3 = _mm_and_si128(lowMask, _mm_srli_epi64(tmp_2_3, 4));
         __m128i by_3 = _mm_loadu_si128((const __m128i *)(y[ib + 1].qs + 16));
         bx_3 = _mm_sub_epi8(bx_3, off);
-        const __m128i i32_3 = mul_sum_i8_pairs(bx_3, by_3);
+        const __m128i i32_3 = mul_sum_i8_pairs(by_3, bx_3);
 
         // Convert int32_t to float
         __m128 p0 = _mm_cvtepi32_ps(i32_0);
@@ -1045,8 +1030,8 @@ void ggml_vec_dot_mxfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
                                               _mm_shuffle_epi8(values128, _mm_and_si128(q4bits_1, m4b)));
         const __m256i q4b_2 = MM256_SET_M128I(_mm_shuffle_epi8(values128, _mm_and_si128(_mm_srli_epi16(q4bits_2, 4), m4b)),
                                               _mm_shuffle_epi8(values128, _mm_and_si128(q4bits_2, m4b)));
-        const __m256i p16_1 = mul_add_epi8(q4b_1, q8b_1);
-        const __m256i p16_2 = mul_add_epi8(q4b_2, q8b_2);
+        const __m256i p16_1 = mul_add_epi8(q8b_1, q4b_1);
+        const __m256i p16_2 = mul_add_epi8(q8b_2, q4b_2);
         const __m256i p_1 = _mm256_madd_epi16(p16_1, mone);
         const __m256i p_2 = _mm256_madd_epi16(p16_2, mone);
         const __m256 scale0 = _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(y[ib + 0].d)*GGML_CPU_E8M0_TO_FP32_HALF(x[ib + 0].e));
@@ -1075,7 +1060,7 @@ void ggml_vec_dot_mxfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
         const __m128i q4b_2_0 = _mm_shuffle_epi8(values128, _mm_and_si128(q4bits_2, m4b));
         const __m128i q4b_2_1 = _mm_shuffle_epi8(values128, _mm_and_si128(_mm_srli_epi16(q4bits_2, 4), m4b));
 
-        const __m256 p = mul_sum_i8_quad_float(q4b_1_0, q4b_1_1, q4b_2_0, q4b_2_1, q8b_1_0, q8b_1_1, q8b_2_0, q8b_2_1);
+        const __m256 p = mul_sum_i8_quad_float(q8b_1_0, q8b_1_1, q8b_2_0, q8b_2_1, q4b_1_0, q4b_1_1, q4b_2_0, q4b_2_1);
         const __m256 deltas = quad_mx_delta_float(x[ib].e, y[ib].d, x[ib + 1].e, y[ib + 1].d);
         accum = _mm256_add_ps(_mm256_mul_ps(deltas, p), accum);
     }
@@ -1135,10 +1120,10 @@ void ggml_vec_dot_nvfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
         const __m256i q4_01 = MM256_SET_M128I(_mm_unpackhi_epi64(q4_01_lo,q4_01_hi), _mm_unpacklo_epi64(q4_01_lo,q4_01_hi));
         const __m256i q4_23 = MM256_SET_M128I(_mm_unpackhi_epi64(q4_23_lo,q4_23_hi),_mm_unpacklo_epi64(q4_23_lo,q4_23_hi));
 
-        const __m256i p01 = mul_add_epi8(q4_01,q8_01);
+        const __m256i p01 = mul_add_epi8(q8_01,q4_01);
         const __m256i p_1 = _mm256_madd_epi16(p01, mone);
 
-        const __m256i p23 = mul_add_epi8(q4_23,q8_23);
+        const __m256i p23 = mul_add_epi8(q8_23,q4_23);
         const __m256i p_2 = _mm256_madd_epi16(p23, mone);
 
         const float dy0 = GGML_CPU_FP16_TO_FP32(y[2*ib].d);
@@ -1183,10 +1168,10 @@ void ggml_vec_dot_nvfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
         const __m128i q4_2 = _mm_unpacklo_epi64(q4_23_lo, q4_23_hi);
         const __m128i q4_3 = _mm_unpackhi_epi64(q4_23_lo, q4_23_hi);
 
-        const __m128i p0_i32 = mul_sum_i8_pairs(q4_0, q8_0);
-        const __m128i p1_i32 = mul_sum_i8_pairs(q4_1, q8_1);
-        const __m128i p2_i32 = mul_sum_i8_pairs(q4_2, q8_2);
-        const __m128i p3_i32 = mul_sum_i8_pairs(q4_3, q8_3);
+        const __m128i p0_i32 = mul_sum_i8_pairs(q8_0, q4_0);
+        const __m128i p1_i32 = mul_sum_i8_pairs(q8_1, q4_1);
+        const __m128i p2_i32 = mul_sum_i8_pairs(q8_2, q4_2);
+        const __m128i p3_i32 = mul_sum_i8_pairs(q8_3, q4_3);
 
         const __m128 p0 = _mm_cvtepi32_ps(p0_i32);
         const __m128 p1 = _mm_cvtepi32_ps(p1_i32);
@@ -1267,7 +1252,7 @@ void ggml_vec_dot_q5_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
 
         __m256i qy = _mm256_loadu_si256((const __m256i *)y[ib].qs);
 
-        const __m256 q = mul_sum_i8_pairs_float(qx, qy);
+        const __m256 q = mul_sum_i8_pairs_float(qy, qx);
 
         /* Multiply q with scale and accumulate */
         acc = _mm256_fmadd_ps(d, q, acc);
@@ -1298,7 +1283,7 @@ void ggml_vec_dot_q5_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
 
         const __m256i by_0 = _mm256_loadu_si256((const __m256i *)y[ib].qs);
 
-        const __m256 q = mul_sum_i8_pairs_float(bx_0, by_0);
+        const __m256 q = mul_sum_i8_pairs_float(by_0, bx_0);
 
         /* Multiply q with scale and accumulate */
         acc = _mm256_add_ps(_mm256_mul_ps(d, q), acc);
@@ -1428,7 +1413,7 @@ void ggml_vec_dot_q8_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
         __m256i qx = _mm256_loadu_si256((const __m256i *)x[ib].qs);
         __m256i qy = _mm256_loadu_si256((const __m256i *)y[ib].qs);
 
-        const __m256 q = mul_sum_i8_pairs_float(qx, qy);
+        const __m256 q = mul_sum_i8_pairs_float_guarded(qx, qy);
 
         // Multiply q with scale and accumulate
         acc = _mm256_fmadd_ps( d, q, acc );
@@ -1448,7 +1433,7 @@ void ggml_vec_dot_q8_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
         const __m128i qy_2_0 = _mm_loadu_si128((const __m128i *)y[ib + 1].qs);
         const __m128i qy_2_1 = _mm_loadu_si128((const __m128i *)y[ib + 1].qs + 1);
 
-        const __m256 p = mul_sum_i8_quad_float(qx_1_0, qx_1_1, qx_2_0, qx_2_1, qy_1_0, qy_1_1, qy_2_0, qy_2_1);
+        const __m256 p = mul_sum_i8_quad_float_guarded(qx_1_0, qx_1_1, qx_2_0, qx_2_1, qy_1_0, qy_1_1, qy_2_0, qy_2_1);
         const __m256 deltas = quad_fp16_delta_float(x[ib].d, y[ib].d, x[ib + 1].d, y[ib + 1].d);
         accum = _mm256_add_ps(_mm256_mul_ps(deltas, p), accum);
     }
@@ -3729,8 +3714,8 @@ void ggml_vec_dot_iq1_s_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
             const __m256i q8b_1 = _mm256_loadu_si256((const __m256i*)q8); q8 += 32;
             const __m256i q8b_2 = _mm256_loadu_si256((const __m256i*)q8); q8 += 32;
 
-            const __m256i dot1 = mul_add_epi8(q1b_1, q8b_1);
-            const __m256i dot2 = mul_add_epi8(q1b_2, q8b_2);
+            const __m256i dot1 = mul_add_epi8(q8b_1, q1b_1);
+            const __m256i dot2 = mul_add_epi8(q8b_2, q1b_2);
             const int16_t ls1 = 2*((qh[ib+0] >> 12) & 7) + 1;
             const int16_t ls2 = 2*((qh[ib+1] >> 12) & 7) + 1;
             const __m256i p1 = _mm256_madd_epi16(dot1, _mm256_set1_epi16(ls1));
@@ -3772,10 +3757,10 @@ void ggml_vec_dot_iq1_s_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
             const __m128i q8b_2_0 = _mm_loadu_si128((const __m128i *)q8); q8 += 16;
             const __m128i q8b_2_1 = _mm_loadu_si128((const __m128i *)q8); q8 += 16;
 
-            const __m128i dot1_0 = mul_add_epi8_sse(q1b_1_0, q8b_1_0);
-            const __m128i dot1_1 = mul_add_epi8_sse(q1b_1_1, q8b_1_1);
-            const __m128i dot2_0 = mul_add_epi8_sse(q1b_2_0, q8b_2_0);
-            const __m128i dot2_1 = mul_add_epi8_sse(q1b_2_1, q8b_2_1);
+            const __m128i dot1_0 = mul_add_epi8_sse(q8b_1_0, q1b_1_0);
+            const __m128i dot1_1 = mul_add_epi8_sse(q8b_1_1, q1b_1_1);
+            const __m128i dot2_0 = mul_add_epi8_sse(q8b_2_0, q1b_2_0);
+            const __m128i dot2_1 = mul_add_epi8_sse(q8b_2_1, q1b_2_1);
             const int16_t ls1 = 2*((qh[ib+0] >> 12) & 7) + 1;
             const int16_t ls2 = 2*((qh[ib+1] >> 12) & 7) + 1;
             const __m128i p1_0 = _mm_madd_epi16(dot1_0, _mm_set1_epi16(ls1));
@@ -3887,18 +3872,16 @@ void ggml_vec_dot_iq1_m_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
             const __m256i q8b_1 = _mm256_loadu_si256((const __m256i*)q8); q8 += 32;
             const __m256i q8b_2 = _mm256_loadu_si256((const __m256i*)q8); q8 += 32;
 
-            const __m256i dot1 = mul_add_epi8(q1b_1, q8b_1);
-            const __m256i dot2 = mul_add_epi8(q1b_2, q8b_2);
-            __m256i dot3, dot4;
-            if (_mm256_movemask_epi8(_mm256_or_si256(_mm256_cmpeq_epi8(q8b_1, _mm256_set1_epi8(-128)),
-                                                     _mm256_cmpeq_epi8(q8b_2, _mm256_set1_epi8(-128))))) {
-                // rare: q8b has -128, which sign_epi8/maddubs cannot negate exactly
-                dot3 = mul_sign_delta_i8(q8b_1, delta1);
-                dot4 = mul_sign_delta_i8(q8b_2, delta2);
-            } else {
-                dot3 = _mm256_maddubs_epi16(mone8, _mm256_sign_epi8(q8b_1, delta1));
-                dot4 = _mm256_maddubs_epi16(mone8, _mm256_sign_epi8(q8b_2, delta2));
-            }
+            // only the sign of delta enters the product (see IQ1M_DELTA below), so
+            // normalize to +/-1 first; then mul_add_epi8's sign flip is exact even
+            // when q8b = -128 (the abs'd operand)
+            const __m256i delta1s = _mm256_sign_epi8(mone8, delta1);
+            const __m256i delta2s = _mm256_sign_epi8(mone8, delta2);
+
+            const __m256i dot1 = mul_add_epi8(q8b_1, q1b_1);
+            const __m256i dot2 = mul_add_epi8(q8b_2, q1b_2);
+            const __m256i dot3 = mul_add_epi8(q8b_1, delta1s);
+            const __m256i dot4 = mul_add_epi8(q8b_2, delta2s);
 
             __m256i scale1 = _mm256_shuffle_epi8(scales, scales_idx1);
             __m256i scale2 = _mm256_shuffle_epi8(scales, scales_idx2);
@@ -3958,10 +3941,10 @@ void ggml_vec_dot_iq1_m_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
             const __m128i q8b_2_0 = _mm_loadu_si128((const __m128i *)q8); q8 += 16;
             const __m128i q8b_2_1 = _mm_loadu_si128((const __m128i *)q8); q8 += 16;
 
-            const __m128i dot1_0 = mul_add_epi8_sse(q1b_1_0, q8b_1_0);
-            const __m128i dot1_1 = mul_add_epi8_sse(q1b_1_1, q8b_1_1);
-            const __m128i dot2_0 = mul_add_epi8_sse(q1b_2_0, q8b_2_0);
-            const __m128i dot2_1 = mul_add_epi8_sse(q1b_2_1, q8b_2_1);
+            const __m128i dot1_0 = mul_add_epi8_sse(q8b_1_0, q1b_1_0);
+            const __m128i dot1_1 = mul_add_epi8_sse(q8b_1_1, q1b_1_1);
+            const __m128i dot2_0 = mul_add_epi8_sse(q8b_2_0, q1b_2_0);
+            const __m128i dot2_1 = mul_add_epi8_sse(q8b_2_1, q1b_2_1);
 
             const __m128i delta1_0 = _mm_set_epi64x(qh[0] & 0x80 ? 0xffffffffffffffff : 0x0101010101010101,
                                                      qh[0] & 0x08 ? 0xffffffffffffffff : 0x0101010101010101);
@@ -3972,10 +3955,10 @@ void ggml_vec_dot_iq1_m_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
             const __m128i delta2_1 = _mm_set_epi64x(qh[3] & 0x80 ? 0xffffffffffffffff : 0x0101010101010101,
                                                      qh[3] & 0x08 ? 0xffffffffffffffff : 0x0101010101010101);
 
-            const __m128i dot3_0 = mul_add_epi8_sse(delta1_0, q8b_1_0);
-            const __m128i dot3_1 = mul_add_epi8_sse(delta1_1, q8b_1_1);
-            const __m128i dot4_0 = mul_add_epi8_sse(delta2_0, q8b_2_0);
-            const __m128i dot4_1 = mul_add_epi8_sse(delta2_1, q8b_2_1);
+            const __m128i dot3_0 = mul_add_epi8_sse(q8b_1_0, delta1_0);
+            const __m128i dot3_1 = mul_add_epi8_sse(q8b_1_1, delta1_1);
+            const __m128i dot4_0 = mul_add_epi8_sse(q8b_2_0, delta2_0);
+            const __m128i dot4_1 = mul_add_epi8_sse(q8b_2_1, delta2_1);
 
             __m128i scale1_0 = _mm_set1_epi16(sc[ib/2] >> 0);
             __m128i scale1_1 = _mm_set1_epi16(sc[ib/2] >> 3);
@@ -4054,8 +4037,8 @@ void ggml_vec_dot_iq4_nl_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const v
                                               _mm_shuffle_epi8(values128, _mm_and_si128(q4bits_1, m4b)));
         const __m256i q4b_2 = MM256_SET_M128I(_mm_shuffle_epi8(values128, _mm_and_si128(_mm_srli_epi16(q4bits_2, 4), m4b)),
                                               _mm_shuffle_epi8(values128, _mm_and_si128(q4bits_2, m4b)));
-        const __m256i p16_1 = mul_add_epi8(q4b_1, q8b_1);
-        const __m256i p16_2 = mul_add_epi8(q4b_2, q8b_2);
+        const __m256i p16_1 = mul_add_epi8(q8b_1, q4b_1);
+        const __m256i p16_2 = mul_add_epi8(q8b_2, q4b_2);
         const __m256i p_1 = _mm256_madd_epi16(p16_1, mone);
         const __m256i p_2 = _mm256_madd_epi16(p16_2, mone);
         accum1 = _mm256_fmadd_ps(_mm256_set1_ps(GGML_CPU_FP16_TO_FP32(y[ib + 0].d)*GGML_CPU_FP16_TO_FP32(x[ib + 0].d)),
@@ -4084,7 +4067,7 @@ void ggml_vec_dot_iq4_nl_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const v
         const __m128i q4b_2_0 = _mm_shuffle_epi8(values128, _mm_and_si128(q4bits_2, m4b));
         const __m128i q4b_2_1 = _mm_shuffle_epi8(values128, _mm_and_si128(_mm_srli_epi16(q4bits_2, 4), m4b));
 
-        const __m256 p = mul_sum_i8_quad_float(q4b_1_0, q4b_1_1, q4b_2_0, q4b_2_1, q8b_1_0, q8b_1_1, q8b_2_0, q8b_2_1);
+        const __m256 p = mul_sum_i8_quad_float(q8b_1_0, q8b_1_1, q8b_2_0, q8b_2_1, q4b_1_0, q4b_1_1, q4b_2_0, q4b_2_1);
         const __m256 deltas = quad_fp16_delta_float(x[ib].d, y[ib].d, x[ib + 1].d, y[ib + 1].d);
         accum = _mm256_add_ps(_mm256_mul_ps(deltas, p), accum);
     }
@@ -4138,8 +4121,8 @@ void ggml_vec_dot_iq4_xs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
                                                   _mm_shuffle_epi8(values128, _mm_and_si128(q4bits_1, m4b)));
             const __m256i q4b_2 = MM256_SET_M128I(_mm_shuffle_epi8(values128, _mm_and_si128(_mm_srli_epi16(q4bits_2, 4), m4b)),
                                                   _mm_shuffle_epi8(values128, _mm_and_si128(q4bits_2, m4b)));
-            const __m256i p16_1 = mul_add_epi8(q4b_1, q8b_1);
-            const __m256i p16_2 = mul_add_epi8(q4b_2, q8b_2);
+            const __m256i p16_1 = mul_add_epi8(q8b_1, q4b_1);
+            const __m256i p16_2 = mul_add_epi8(q8b_2, q4b_2);
             const int16_t ls1 = ((x[ibl].scales_l[ib/2] & 0xf) | ((sh << 4) & 0x30)) - 32;
             const int16_t ls2 = ((x[ibl].scales_l[ib/2] >>  4) | ((sh << 2) & 0x30)) - 32;
             sh >>= 4;
@@ -4178,10 +4161,10 @@ void ggml_vec_dot_iq4_xs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
             const __m128i q4b_1_1 = _mm_shuffle_epi8(values128, _mm_and_si128(_mm_srli_epi16(q4bits_1, 4), m4b));
             const __m128i q4b_2_0 = _mm_shuffle_epi8(values128, _mm_and_si128(q4bits_2, m4b));
             const __m128i q4b_2_1 = _mm_shuffle_epi8(values128, _mm_and_si128(_mm_srli_epi16(q4bits_2, 4), m4b));
-            const __m128i p16_1_0 = mul_add_epi8_sse(q4b_1_0, q8b_1_0);
-            const __m128i p16_1_1 = mul_add_epi8_sse(q4b_1_1, q8b_1_1);
-            const __m128i p16_2_0 = mul_add_epi8_sse(q4b_2_0, q8b_2_0);
-            const __m128i p16_2_1 = mul_add_epi8_sse(q4b_2_1, q8b_2_1);
+            const __m128i p16_1_0 = mul_add_epi8_sse(q8b_1_0, q4b_1_0);
+            const __m128i p16_1_1 = mul_add_epi8_sse(q8b_1_1, q4b_1_1);
+            const __m128i p16_2_0 = mul_add_epi8_sse(q8b_2_0, q4b_2_0);
+            const __m128i p16_2_1 = mul_add_epi8_sse(q8b_2_1, q4b_2_1);
             const int16_t ls1 = ((x[ibl].scales_l[ib/2] & 0xf) | ((sh << 4) & 0x30)) - 32;
             const int16_t ls2 = ((x[ibl].scales_l[ib/2] >>  4) | ((sh << 2) & 0x30)) - 32;
             sh >>= 4;
